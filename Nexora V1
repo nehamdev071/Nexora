@@ -1,1 +1,967 @@
+mkdir -p src/lib src/components src/app/{calendario,boletim,arquivos,nexi,configuracoes,api/nexi}
 
+cat > .env.local <<'ARQUIVO'
+ANTHROPIC_API_KEY=cole_sua_chave_aqui
+ARQUIVO
+
+cat > src/lib/db.ts <<'ARQUIVO'
+import Dexie, { type Table } from 'dexie';
+
+export interface Atividade { id?: number; titulo: string; descricao?: string; prazo: string; concluidaEm?: string | null; criadoEm: string; }
+export interface Disciplina { id?: number; nome: string; ordem: number; ativa: boolean; }
+export interface Nota { id?: number; disciplinaId: number; unidade: 1 | 2 | 3; decimos: number; }
+export interface Pasta { id?: number; nome: string; paiId?: number | null; criadoEm: string; }
+export interface Arquivo { id?: number; pastaId?: number | null; nome: string; mimeType: string; tamanho: number; blob: Blob; criadoEm: string; }
+export interface Trabalho { id?: number; pastaId?: number | null; titulo: string; conteudo: string; versao: number; criadoEm: string; atualizadoEm: string; }
+export interface Memoria { id?: number; chave: string; valor: string; criadoEm: string; }
+export interface Config { chave: string; valor: unknown; }
+
+class NexoraDB extends Dexie {
+  atividades!: Table<Atividade, number>;
+  disciplinas!: Table<Disciplina, number>;
+  notas!: Table<Nota, number>;
+  pastas!: Table<Pasta, number>;
+  arquivos!: Table<Arquivo, number>;
+  trabalhos!: Table<Trabalho, number>;
+  memorias!: Table<Memoria, number>;
+  config!: Table<Config, string>;
+  constructor() {
+    super('nexora');
+    this.version(1).stores({
+      atividades: '++id, prazo, concluidaEm',
+      disciplinas: '++id, nome, ordem, ativa',
+      notas: '++id, disciplinaId, [disciplinaId+unidade]',
+      pastas: '++id, paiId, nome',
+      arquivos: '++id, pastaId, criadoEm',
+      trabalhos: '++id, pastaId, atualizadoEm',
+      memorias: '++id, &chave',
+      config: 'chave',
+    });
+  }
+}
+
+export const db = new NexoraDB();
+
+export async function lerConfig<T>(chave: string, padrao: T): Promise<T> {
+  const r = await db.config.get(chave);
+  return r ? (r.valor as T) : padrao;
+}
+export async function gravarConfig(chave: string, valor: unknown): Promise<void> {
+  await db.config.put({ chave, valor });
+}
+
+const DISCIPLINAS_PADRAO = [
+  'Língua Portuguesa','Matemática','Química','Física','Biologia','Educação Física',
+  'Geografia','História','Sociologia','Educação Sociocientífica','História da Bahia',
+  'Educação Digital e Midiática','Linguagens e Culturas','Etnomatemática','Língua Inglesa','Artes',
+] as const;
+
+export async function garantirSeed(): Promise<void> {
+  if (await db.config.get('seed:v1')) return;
+  await db.transaction('rw', db.disciplinas, db.config, async () => {
+    if ((await db.disciplinas.count()) === 0) {
+      await db.disciplinas.bulkAdd(DISCIPLINAS_PADRAO.map((nome, ordem) => ({ nome, ordem, ativa: true })));
+    }
+    await db.config.put({ chave: 'seed:v1', valor: true });
+  });
+}
+
+export async function listarPastas(paiId: number | null): Promise<Pasta[]> {
+  if (paiId === null) {
+    const todas = await db.pastas.toArray();
+    return todas.filter((p) => p.paiId == null).sort((a, b) => a.nome.localeCompare(b.nome));
+  }
+  return (await db.pastas.where('paiId').equals(paiId).toArray()).sort((a, b) => a.nome.localeCompare(b.nome));
+}
+
+export async function excluirPastaRecursivo(pastaId: number): Promise<void> {
+  await db.transaction('rw', db.pastas, db.arquivos, db.trabalhos, async () => {
+    const filhas = await db.pastas.where('paiId').equals(pastaId).toArray();
+    for (const f of filhas) if (f.id != null) await excluirPastaRecursivo(f.id);
+    await db.arquivos.where('pastaId').equals(pastaId).delete();
+    await db.trabalhos.where('pastaId').equals(pastaId).delete();
+    await db.pastas.delete(pastaId);
+  });
+}
+ARQUIVO
+
+cat > src/lib/boletim.ts <<'ARQUIVO'
+export const UNIDADES = 3;
+export const META_TOTAL = 15;
+export const MAX_POR_UNIDADE = 10;
+
+const fmt = new Intl.NumberFormat('pt-BR', { minimumFractionDigits: 0, maximumFractionDigits: 1 });
+export const pontosParaTexto = (p: number) => fmt.format(p);
+
+export function pontosParaDecimos(pontos: number | null | undefined): number | null {
+  if (pontos == null || Number.isNaN(pontos)) return null;
+  if (pontos < 0 || pontos > MAX_POR_UNIDADE) throw new RangeError('Nota fora de 0-10');
+  return Math.round(pontos * 10);
+}
+
+export type Situacao = 'sem_notas' | 'em_andamento' | 'meta_inalcancavel' | 'aprovado' | 'abaixo_da_meta';
+
+export interface ResultadoDisciplina {
+  decimos: (number | null)[];
+  unidadesLancadas: number;
+  unidadesRestantes: number;
+  completo: boolean;
+  totalPontos: number;
+  maximoPossivelPontos: number;
+  faltamPontos: number;
+  excedentePontos: number;
+  metaAtingida: boolean;
+  situacao: Situacao;
+  rotulo: string;
+}
+
+export function calcularDisciplina(entrada: (number | null | undefined)[]): ResultadoDisciplina {
+  const decimos = Array.from({ length: UNIDADES }, (_, i) => {
+    const v = entrada[i];
+    if (v == null) return null;
+    if (!Number.isInteger(v) || v < 0 || v > MAX_POR_UNIDADE * 10) throw new RangeError('Decimos invalidos');
+    return v;
+  });
+  const lancadas = decimos.filter((d): d is number => d !== null);
+  const totalDecimos = lancadas.reduce((a, b) => a + b, 0);
+  const unidadesLancadas = lancadas.length;
+  const unidadesRestantes = UNIDADES - unidadesLancadas;
+  const completo = unidadesRestantes === 0;
+  const totalPontos = totalDecimos / 10;
+  const maximoPossivelPontos = (totalDecimos + unidadesRestantes * MAX_POR_UNIDADE * 10) / 10;
+  const saldo = META_TOTAL * 10 - totalDecimos;
+  const faltamPontos = saldo > 0 ? saldo / 10 : 0;
+  const excedentePontos = saldo < 0 ? -saldo / 10 : 0;
+  const metaAtingida = saldo <= 0;
+
+  let situacao: Situacao;
+  if (unidadesLancadas === 0) situacao = 'sem_notas';
+  else if (!completo && maximoPossivelPontos < META_TOTAL) situacao = 'meta_inalcancavel';
+  else if (!completo) situacao = 'em_andamento';
+  else if (metaAtingida) situacao = 'aprovado';
+  else situacao = 'abaixo_da_meta';
+
+  let rotulo: string;
+  if (unidadesLancadas === 0) rotulo = 'Sem notas';
+  else if (saldo > 0) rotulo = 'Faltam ' + pontosParaTexto(faltamPontos) + ' pontos';
+  else if (saldo === 0) rotulo = 'Meta atingida';
+  else rotulo = '+' + pontosParaTexto(excedentePontos) + ' pontos alem da meta';
+
+  return { decimos, unidadesLancadas, unidadesRestantes, completo, totalPontos, maximoPossivelPontos, faltamPontos, excedentePontos, metaAtingida, situacao, rotulo };
+}
+
+export async function salvarNota(disciplinaId: number, unidade: 1 | 2 | 3, pontos: number | null) {
+  const { db } = await import('./db');
+  const existente = await db.notas.where('[disciplinaId+unidade]').equals([disciplinaId, unidade]).first();
+  if (pontos === null) {
+    if (existente?.id != null) await db.notas.delete(existente.id);
+    return;
+  }
+  const decimos = pontosParaDecimos(pontos)!;
+  if (existente?.id != null) await db.notas.update(existente.id, { decimos });
+  else await db.notas.add({ disciplinaId, unidade, decimos });
+}
+ARQUIVO
+
+cat > src/lib/atividades.ts <<'ARQUIVO'
+export const STATUS = {
+  PENDENTE: 'pendente',
+  EM_ATRASO: 'em_atraso',
+  CONCLUIDA_NO_PRAZO: 'concluida_no_prazo',
+  CONCLUIDA_COM_ATRASO: 'concluida_com_atraso',
+} as const;
+
+export type Status = (typeof STATUS)[keyof typeof STATUS];
+
+export const ROTULO: Record<Status, string> = {
+  pendente: 'Pendente',
+  em_atraso: 'Em atraso',
+  concluida_no_prazo: 'Concluida no prazo',
+  concluida_com_atraso: 'Concluida com atraso',
+};
+
+export interface ComPrazo { prazo: string; concluidaEm?: string | null; }
+
+export function calcularStatus(a: ComPrazo, agora: Date = new Date()): Status {
+  const prazo = new Date(a.prazo);
+  if (Number.isNaN(prazo.getTime())) throw new TypeError('Data invalida');
+  if (!a.concluidaEm) return agora > prazo ? STATUS.EM_ATRASO : STATUS.PENDENTE;
+  return new Date(a.concluidaEm) > prazo ? STATUS.CONCLUIDA_COM_ATRASO : STATUS.CONCLUIDA_NO_PRAZO;
+}
+
+export function proximasAtividades<T extends ComPrazo>(lista: T[], agora = new Date(), limite = 5): (T & { status: Status })[] {
+  return lista
+    .filter((a) => !a.concluidaEm)
+    .map((a) => ({ ...a, status: calcularStatus(a, agora) }))
+    .sort((x, y) => new Date(x.prazo).getTime() - new Date(y.prazo).getTime())
+    .slice(0, limite);
+}
+ARQUIVO
+
+cat > src/lib/backup.ts <<'ARQUIVO'
+import { db } from './db';
+
+const VERSAO = 1;
+
+function blobParaBase64(blob: Blob): Promise<string> {
+  return new Promise((res, rej) => {
+    const l = new FileReader();
+    l.onload = () => res(String(l.result).split(',')[1] ?? '');
+    l.onerror = () => rej(l.error);
+    l.readAsDataURL(blob);
+  });
+}
+
+function base64ParaBlob(b64: string, mime: string): Blob {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+export async function exportarBackup(): Promise<void> {
+  const [atividades, disciplinas, notas, pastas, trabalhos, memorias, config, arquivos] = await Promise.all([
+    db.atividades.toArray(), db.disciplinas.toArray(), db.notas.toArray(), db.pastas.toArray(),
+    db.trabalhos.toArray(), db.memorias.toArray(), db.config.toArray(), db.arquivos.toArray(),
+  ]);
+  const arq = await Promise.all(arquivos.map(async (a) => ({ ...a, blob: undefined, base64: await blobParaBase64(a.blob) })));
+  const json = JSON.stringify({
+    versao: VERSAO, geradoEm: new Date().toISOString(),
+    tabelas: { atividades, disciplinas, notas, pastas, trabalhos, memorias, config, arquivos: arq },
+  });
+  const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'nexora-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function importarBackup(arquivo: File): Promise<void> {
+  const dados = JSON.parse(await arquivo.text());
+  if (dados?.versao !== VERSAO) throw new Error('Backup incompativel.');
+  const t = dados.tabelas;
+  const arquivos = await Promise.all(
+    (t.arquivos as (Record<string, unknown> & { base64?: string; mimeType?: string })[]).map(
+      async ({ base64, mimeType, ...resto }) => ({
+        ...resto,
+        mimeType: mimeType ?? 'application/octet-stream',
+        blob: base64ParaBlob(base64 ?? '', mimeType ?? 'application/octet-stream'),
+      })
+    )
+  );
+  await db.transaction('rw', [db.atividades, db.disciplinas, db.notas, db.pastas, db.trabalhos, db.memorias, db.config, db.arquivos], async () => {
+    await Promise.all([db.atividades.clear(), db.disciplinas.clear(), db.notas.clear(), db.pastas.clear(), db.trabalhos.clear(), db.memorias.clear(), db.config.clear(), db.arquivos.clear()]);
+    await db.atividades.bulkAdd(t.atividades as never[]);
+    await db.disciplinas.bulkAdd(t.disciplinas as never[]);
+    await db.notas.bulkAdd(t.notas as never[]);
+    await db.pastas.bulkAdd(t.pastas as never[]);
+    await db.trabalhos.bulkAdd(t.trabalhos as never[]);
+    await db.memorias.bulkAdd(t.memorias as never[]);
+    await db.config.bulkAdd(t.config as never[]);
+    await db.arquivos.bulkAdd(arquivos as never[]);
+  });
+}
+ARQUIVO
+
+cat > src/lib/pdf.ts <<'ARQUIVO'
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+
+function quebrar(texto: string, max: number): string[] {
+  const out: string[] = [];
+  for (const p of texto.split('\n')) {
+    if (!p.trim()) { out.push(''); continue; }
+    let l = '';
+    for (const w of p.split(' ')) {
+      const t = l ? l + ' ' + w : w;
+      if (t.length > max) { if (l) out.push(l); l = w; } else l = t;
+    }
+    if (l) out.push(l);
+  }
+  return out;
+}
+
+export async function gerarPdf(titulo: string, texto: string): Promise<Blob> {
+  const doc = await PDFDocument.create();
+  const f = await doc.embedFont(StandardFonts.Helvetica);
+  const fB = await doc.embedFont(StandardFonts.HelveticaBold);
+  const W = 595.28, H = 841.89, M = 56;
+  const maxLinhas = Math.floor((H - M * 2 - 40) / 16);
+  let pag = doc.addPage([W, H]);
+  let y = H - M;
+  pag.drawText(titulo.slice(0, 80), { x: M, y, size: 16, font: fB, color: rgb(0.06, 0.09, 0.16) });
+  y -= 32;
+  let c = 0;
+  for (const l of quebrar(texto, 88)) {
+    if (c >= maxLinhas) { pag = doc.addPage([W, H]); y = H - M; c = 0; }
+    if (l) pag.drawText(l, { x: M, y, size: 11, font: f });
+    y -= 16; c++;
+  }
+  return new Blob([(await doc.save()) as unknown as BlobPart], { type: 'application/pdf' });
+}
+
+export function baixarBlob(blob: Blob, nome: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = nome; a.click();
+  URL.revokeObjectURL(url);
+}
+ARQUIVO
+
+cat > src/app/globals.css <<'ARQUIVO'
+:root{
+  color-scheme:light dark;
+  --esp-1:4px;--esp-2:8px;--esp-3:12px;--esp-4:16px;--esp-5:24px;--esp-6:32px;--esp-7:48px;--esp-8:64px;
+  --txt-xs:12px;--txt-sm:14px;--txt-md:16px;--txt-lg:18px;--txt-xl:20px;--txt-2xl:24px;--txt-3xl:32px;
+  --raio-sm:8px;--raio-md:12px;--raio-lg:16px;--raio-full:999px;
+  --largura-max:1200px;--dur:160ms;--pop:180ms;
+  --ease-out:cubic-bezier(0.23,1,0.32,1);--ease:cubic-bezier(0.25,0.1,0.25,1);
+}
+:root,[data-tema="claro"]{
+  --fundo:#f7f8fb;--sup:#fff;--sup2:#f0f2f7;--texto:#0f172a;--texto2:#55607a;
+  --borda:#e2e6ef;--marca:#4338ca;--marca-txt:#fff;--marca-suave:#eef0ff;
+  --ok:#15803d;--alerta:#b45309;--erro:#b91c1c;--sombra:0 1px 2px rgb(15 23 42/.06);
+}
+[data-tema="escuro"]{
+  --fundo:#0a0e17;--sup:#111726;--sup2:#182031;--texto:#e8ecf5;--texto2:#a2acca;
+  --borda:#232d44;--marca:#8b8bff;--marca-txt:#0a0e17;--marca-suave:#1b2340;
+  --ok:#4ade80;--alerta:#fbbf24;--erro:#f87171;--sombra:0 1px 2px rgb(0 0 0/.4);
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-tap-highlight-color:transparent;-webkit-text-size-adjust:100%;overscroll-behavior:none;scroll-behavior:smooth}
+body{margin:0;min-height:100dvh;background:var(--fundo);color:var(--texto);font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:var(--txt-md);line-height:1.6;-webkit-font-smoothing:antialiased}
+h1,h2,h3{margin:0 0 var(--esp-3);line-height:1.2;letter-spacing:-.015em}
+h1{font-size:var(--txt-3xl);font-weight:700}h2{font-size:var(--txt-2xl);font-weight:700}h3{font-size:var(--txt-lg);font-weight:600}
+p{margin:0 0 var(--esp-4)}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:2px solid var(--marca);outline-offset:2px;border-radius:var(--raio-sm)}
+button,a,[role="button"],.btn{touch-action:manipulation;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+p,li,.texto-conteudo{user-select:text;-webkit-user-select:text}
+input,textarea,select{font-size:16px;font-family:inherit}
+.shell{min-height:100dvh;display:flex;flex-direction:column}
+.container{width:100%;max-width:var(--largura-max);margin:0 auto;padding:0 var(--esp-4)}
+main.conteudo{flex:1;padding:var(--esp-6) 0 var(--esp-8)}
+.menu-topo{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--fundo) 88%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--borda);padding-top:env(safe-area-inset-top,0px)}
+.menu-inner{display:flex;align-items:center;gap:var(--esp-3);min-height:60px}
+.marca{display:flex;align-items:center;gap:var(--esp-2);font-weight:700;font-size:var(--txt-lg)}
+.marca-ponto{width:22px;height:22px;border-radius:7px;background:var(--marca);flex:none}
+.menu-lista{display:flex;gap:var(--esp-1);margin:0 0 0 auto;padding:0;list-style:none}
+.menu-lista a{display:block;padding:var(--esp-2) var(--esp-3);border-radius:var(--raio-sm);font-size:var(--txt-sm);color:var(--texto2);transition:background var(--dur) var(--ease),color var(--dur) var(--ease)}
+.menu-lista a[aria-current="page"]{background:var(--marca-suave);color:var(--marca);font-weight:600}
+.icone-btn{width:40px;height:40px;display:grid;place-items:center;border:1px solid var(--borda);border-radius:var(--raio-sm);background:transparent;color:var(--texto);cursor:pointer;font-size:15px;transition:transform var(--dur) var(--ease-out),background var(--dur) var(--ease)}
+.icone-btn:active{transform:scale(.97)}
+.menu-mobile-btn{display:none}
+@media(max-width:860px){
+  .menu-mobile-btn{display:grid;margin-left:auto}
+  .menu-lista{position:absolute;top:100%;left:0;right:0;flex-direction:column;background:var(--fundo);border-bottom:1px solid var(--borda);padding:var(--esp-3) var(--esp-4) var(--esp-5);margin-left:0;clip-path:inset(0 0 100% 0);opacity:0;pointer-events:none;transition:clip-path var(--pop) var(--ease-out),opacity var(--pop) var(--ease-out)}
+  .menu-lista.aberto{clip-path:inset(0 0 0 0);opacity:1;pointer-events:auto}
+  .menu-lista a{padding:var(--esp-3);font-size:var(--txt-md)}
+}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--esp-2);padding:var(--esp-3) var(--esp-5);border-radius:var(--raio-md);border:1px solid transparent;font:inherit;font-weight:600;font-size:var(--txt-sm);cursor:pointer;transition:transform var(--dur) var(--ease-out),background var(--dur) var(--ease),border-color var(--dur) var(--ease),opacity var(--dur) var(--ease)}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primario{background:var(--marca);color:var(--marca-txt)}
+.btn-fantasma{background:transparent;color:var(--texto);border-color:var(--borda)}
+.btn-perigo{background:transparent;color:var(--erro);border-color:var(--erro)}
+.btn-pequeno{padding:var(--esp-2) var(--esp-3);font-size:var(--txt-xs)}
+@media(hover:hover) and (pointer:fine){.btn-primario:hover{opacity:.9}.btn-fantasma:hover{background:var(--sup2)}}
+.card{background:var(--sup);border:1px solid var(--borda);border-radius:var(--raio-lg);padding:var(--esp-5)}
+.card-titulo{display:flex;align-items:center;justify-content:space-between;gap:var(--esp-3);margin-bottom:var(--esp-4)}
+.card-titulo h2,.card-titulo h3{margin:0}
+.grade{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:var(--esp-4)}
+.campo{margin-bottom:var(--esp-3)}
+.campo label{display:block;font-size:var(--txt-sm);font-weight:600;margin-bottom:var(--esp-1)}
+.campo input,.campo textarea,.campo select{width:100%;padding:var(--esp-3);background:var(--fundo);color:var(--texto);border:1px solid var(--borda);border-radius:var(--raio-sm);outline:none;transition:border-color var(--dur) var(--ease),box-shadow var(--dur) var(--ease)}
+.campo input:focus,.campo textarea:focus,.campo select:focus{border-color:var(--marca);box-shadow:0 0 0 3px var(--marca-suave)}
+.campo textarea{resize:vertical;min-height:90px}
+.linha-campos{display:flex;gap:var(--esp-3);flex-wrap:wrap}
+.linha-campos>*{flex:1 1 160px}
+.tabela-wrap{overflow-x:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-size:var(--txt-sm)}
+th,td{text-align:left;padding:var(--esp-3);border-bottom:1px solid var(--borda);vertical-align:middle}
+th{font-weight:600;color:var(--texto2);font-size:var(--txt-xs);text-transform:uppercase;letter-spacing:.06em}
+.boletim td,.boletim th,.num{font-variant-numeric:tabular-nums}
+.boletim input{width:68px;padding:var(--esp-2);text-align:center;background:var(--fundo);color:var(--texto);border:1px solid var(--borda);border-radius:var(--raio-sm)}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:var(--txt-xs);font-weight:600;padding:3px 9px;border-radius:var(--raio-full)}
+.status::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.status-pendente{background:var(--marca-suave);color:var(--marca)}
+.status-em_atraso{background:color-mix(in srgb,var(--erro) 14%,transparent);color:var(--erro)}
+.status-concluida_no_prazo{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+.status-concluida_com_atraso{background:color-mix(in srgb,var(--alerta) 16%,transparent);color:var(--alerta)}
+.texto-suave{color:var(--texto2)}.texto-xs{font-size:var(--txt-xs)}.texto-sm{font-size:var(--txt-sm)}
+.pasta-gatilho{display:inline-flex;align-items:center;gap:var(--esp-3);padding:var(--esp-3) var(--esp-4);background:var(--sup);border:1px solid var(--borda);border-radius:var(--raio-md);color:var(--texto);font:inherit;font-weight:600;font-size:var(--txt-sm);cursor:pointer;transition:border-color var(--dur) var(--ease),transform var(--dur) var(--ease-out)}
+.pasta-gatilho:active{transform:scale(.97)}
+.pasta-icone{width:30px;height:30px;flex:none;pointer-events:none;-webkit-touch-callout:none}
+.pasta__verso{fill:var(--marca);opacity:.3}
+.pasta__frente{fill:var(--marca);opacity:.85}
+.pasta__folha{fill:var(--sup);stroke:var(--borda);stroke-width:1}
+.pasta__folhas>*{transition:transform 220ms var(--ease-out)}
+.pasta__folha--um{transition-delay:60ms}.pasta__folha--dois{transition-delay:30ms}
+.pasta-gatilho.aberta .pasta__folha--um{transform:translateY(-6px)}
+.pasta-gatilho.aberta .pasta__folha--dois{transform:translateY(-4px)}
+.pasta-gatilho.aberta .pasta__folha--tres{transform:translateY(-2px)}
+@media(hover:hover) and (pointer:fine){
+  .pasta-gatilho:hover{border-color:var(--marca)}
+  .pasta-gatilho:hover .pasta__folha--um{transform:translateY(-6px)}
+  .pasta-gatilho:hover .pasta__folha--dois{transform:translateY(-4px)}
+  .pasta-gatilho:hover .pasta__folha--tres{transform:translateY(-2px)}
+}
+.item{display:flex;align-items:center;justify-content:space-between;gap:var(--esp-3);padding:var(--esp-3) 0;border-bottom:1px solid var(--borda)}
+.item:last-child{border-bottom:none}
+.item-titulo{font-weight:600;font-size:var(--txt-sm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cal-grade{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.cal-cabecalho{font-size:var(--txt-xs);text-transform:uppercase;color:var(--texto2);text-align:center;padding:var(--esp-2) 0;font-weight:600}
+.cal-dia{aspect-ratio:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;border-radius:var(--raio-sm);border:1px solid transparent;background:transparent;color:var(--texto);font:inherit;font-size:var(--txt-sm);cursor:pointer;font-variant-numeric:tabular-nums;transition:background var(--dur) var(--ease),transform var(--dur) var(--ease-out)}
+.cal-dia:active{transform:scale(.94)}
+.cal-dia.fora{color:var(--texto2);opacity:.4}
+.cal-dia.hoje{border-color:var(--marca);font-weight:700}
+.cal-dia.selecionado{background:var(--marca);color:var(--marca-txt)}
+.cal-dia .ponto{width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.8}
+.chat-mensagens{display:flex;flex-direction:column;gap:var(--esp-3);min-height:320px;max-height:56dvh;overflow-y:auto;overscroll-behavior:contain;padding:var(--esp-2) 0}
+.chat-bolha{max-width:88%;padding:var(--esp-3) var(--esp-4);border-radius:var(--raio-md);font-size:var(--txt-sm);white-space:pre-wrap;word-break:break-word}
+.chat-bolha.usuario{align-self:flex-end;background:var(--marca);color:var(--marca-txt)}
+.chat-bolha.nex{align-self:flex-start;background:var(--sup2)}
+.chat-acoes{display:flex;gap:var(--esp-2);align-items:flex-end;margin-top:var(--esp-3)}
+.chat-acoes textarea{flex:1;min-height:48px}
+.modos{display:flex;gap:var(--esp-2);flex-wrap:wrap;margin-bottom:var(--esp-4)}
+.modo-btn{padding:var(--esp-2) var(--esp-3);border-radius:var(--raio-sm);border:1px solid var(--borda);background:transparent;color:var(--texto2);font:inherit;font-size:var(--txt-xs);font-weight:600;cursor:pointer;transition:all var(--dur) var(--ease)}
+.modo-btn[aria-pressed="true"]{background:var(--marca-suave);color:var(--marca);border-color:var(--marca)}
+.aviso{padding:var(--esp-3) var(--esp-4);border-radius:var(--raio-sm);font-size:var(--txt-sm);border:1px solid var(--borda);background:var(--sup2)}
+.aviso-erro{border-color:var(--erro);color:var(--erro)}
+.fundo-shader{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;background:radial-gradient(60% 50% at 15% 10%,var(--marca-suave),transparent 70%),radial-gradient(50% 40% at 90% 80%,var(--marca-suave),transparent 70%)}
+.camada-conteudo{position:relative;z-index:1}
+@media(prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+  .pasta__folhas>*,.pasta-gatilho:active,.btn:active,.cal-dia:active{transform:none!important}
+  .menu-lista{clip-path:none}
+}
+ARQUIVO
+
+cat > src/app/layout.tsx <<'ARQUIVO'
+import type { Metadata, Viewport } from 'next';
+import './globals.css';
+import { Menu } from '@/components/Menu';
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  viewportFit: 'cover',
+  interactiveWidget: 'resizes-content',
+  themeColor: [
+    { media: '(prefers-color-scheme: light)', color: '#f7f8fb' },
+    { media: '(prefers-color-scheme: dark)', color: '#0a0e17' },
+  ],
+};
+
+export const metadata: Metadata = {
+  title: 'Nexora',
+  description: 'Plataforma de estudos com Nexi IA.',
+  applicationName: 'Nexora',
+  appleWebApp: { capable: true, statusBarStyle: 'default', title: 'Nexora' },
+  formatDetection: { telephone: false },
+};
+
+const SCRIPT_TEMA = `
+(function(){
+  try {
+    var t = localStorage.getItem('nexora:tema') || 'auto';
+    var efetivo = t === 'auto'
+      ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'escuro' : 'claro')
+      : t;
+    document.documentElement.dataset.tema = efetivo;
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', efetivo === 'escuro' ? '#0a0e17' : '#f7f8fb');
+  } catch(e) {}
+})();
+`;
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="pt-BR" data-tema="claro" suppressHydrationWarning>
+      <head><script dangerouslySetInnerHTML={{ __html: SCRIPT_TEMA }} /></head>
+      <body>
+        <div className="shell">
+          <Menu />
+          <main className="conteudo"><div className="container">{children}</div></main>
+        </div>
+      </body>
+    </html>
+  );
+}
+ARQUIVO
+
+cat > src/components/Menu.tsx <<'ARQUIVO'
+'use client';
+
+import { usePathname } from 'next/navigation';
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
+
+const ITENS = [
+  { href: '/', rotulo: 'Inicio' },
+  { href: '/nexi', rotulo: 'Nexi IA' },
+  { href: '/arquivos', rotulo: 'Arquivos' },
+  { href: '/calendario', rotulo: 'Calendario' },
+  { href: '/boletim', rotulo: 'Boletim' },
+  { href: '/configuracoes', rotulo: 'Ajustes' },
+];
+
+type Tema = 'claro' | 'escuro' | 'auto';
+
+export function Menu() {
+  const caminho = usePathname();
+  const [aberto, setAberto] = useState(false);
+  const [tema, setTema] = useState<Tema>('auto');
+
+  useEffect(() => {
+    try {
+      const salvo = (localStorage.getItem('nexora:tema') as Tema) || 'auto';
+      setTema(salvo);
+    } catch {}
+  }, []);
+
+  useEffect(() => { setAberto(false); }, [caminho]);
+
+  function aplicar(novo: Tema) {
+    setTema(novo);
+    const efetivo = novo === 'auto'
+      ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'escuro' : 'claro')
+      : novo;
+    document.documentElement.dataset.tema = efetivo;
+    try { localStorage.setItem('nexora:tema', novo); } catch {}
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', efetivo === 'escuro' ? '#0a0e17' : '#f7f8fb');
+  }
+
+  return (
+    <header className="menu-topo">
+      <div className="container menu-inner">
+        <Link href="/" className="marca">
+          <span className="marca-ponto" aria-hidden="true" />
+          Nexora
+        </Link>
+        <nav>
+          <ul className={aberto ? 'menu-lista aberto' : 'menu-lista'} id="menu-principal">
+            {ITENS.map((i) => (
+              <li key={i.href}>
+                <Link href={i.href} aria-current={caminho === i.href ? 'page' : undefined}>{i.rotulo}</Link>
+              </li>
+            ))}
+          </ul>
+        </nav>
+        <button type="button" className="icone-btn" onClick={() => aplicar(tema === 'escuro' ? 'claro' : 'escuro')} aria-label="Alternar tema">
+          {tema === 'escuro' ? '\u2600' : '\u25D0'}
+        </button>
+        <button type="button" className="icone-btn menu-mobile-btn" onClick={() => setAberto((v) => !v)} aria-expanded={aberto} aria-controls="menu-principal" aria-label="Menu">
+          {aberto ? '\u00D7' : '\u2261'}
+        </button>
+      </div>
+    </header>
+  );
+}
+ARQUIVO
+
+cat > src/components/FundoShader.tsx <<'ARQUIVO'
+'use client';
+import { useEffect, useRef } from 'react';
+
+export function FundoShader() {
+  const ref = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const gl = canvas.getContext('webgl', { alpha: true, antialias: false, depth: false, powerPreference: 'low-power' });
+    if (!gl) return;
+
+    const vert = 'attribute vec2 a; void main(){ gl_Position=vec4(a,0.0,1.0); }';
+    const frag = `
+      precision mediump float;
+      uniform vec2 r; uniform float t;
+      float h(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
+      float n(vec2 p){ vec2 i=floor(p),f=fract(p); vec2 u=f*f*(3.0-2.0*f);
+        return mix(mix(h(i),h(i+vec2(1,0)),u.x),mix(h(i+vec2(0,1)),h(i+vec2(1,1)),u.x),u.y); }
+      float fbm(vec2 p){ float v=0.0,a=0.5; for(int i=0;i<4;i++){ v+=a*n(p); p*=2.0; a*=0.5; } return v; }
+      void main(){
+        vec2 uv=gl_FragCoord.xy/r; float tt=t*0.05;
+        float v=fbm(uv*3.0+vec2(tt,tt*0.7))+0.5*fbm(uv*5.1-vec2(tt*0.8,tt*1.1));
+        v/=1.5;
+        vec3 c=mix(vec3(0.26,0.22,0.79),vec3(0.05,0.65,0.64),smoothstep(0.25,0.85,v));
+        float vin=smoothstep(1.15,0.25,length(uv-0.5)*1.6);
+        gl_FragColor=vec4(c,0.16*vin*(0.55+0.45*v));
+      }`;
+
+    const comp = (tipo: number, src: string) => { const s = gl.createShader(tipo)!; gl.shaderSource(s, src); gl.compileShader(s); return s; };
+    const prog = gl.createProgram()!;
+    gl.attachShader(prog, comp(gl.VERTEX_SHADER, vert));
+    gl.attachShader(prog, comp(gl.FRAGMENT_SHADER, frag));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,3,-1,-1,3]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'a');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+    const uR = gl.getUniformLocation(prog, 'r');
+    const uT = gl.getUniformLocation(prog, 't');
+
+    function desenhar(tempo: number) {
+      const prop = canvas!.clientHeight / Math.max(canvas!.clientWidth, 1) || 0.5;
+      const w = 420, hh = Math.round(420 * prop);
+      if (canvas!.width !== w || canvas!.height !== hh) {
+        canvas!.width = w; canvas!.height = hh;
+        gl!.viewport(0, 0, w, hh);
+        gl!.uniform2f(uR, w, hh);
+      }
+      gl!.clearColor(0, 0, 0, 0);
+      gl!.clear(gl!.COLOR_BUFFER_BIT);
+      gl!.uniform1f(uT, tempo);
+      gl!.drawArrays(gl!.TRIANGLES, 0, 3);
+    }
+
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { desenhar(0); return; }
+
+    let raf = 0;
+    const inicio = performance.now();
+    const laco = (agora: number) => { desenhar((agora - inicio) / 1000); raf = requestAnimationFrame(laco); };
+    const aoVis = () => { if (document.hidden) cancelAnimationFrame(raf); else raf = requestAnimationFrame(laco); };
+    document.addEventListener('visibilitychange', aoVis);
+    raf = requestAnimationFrame(laco);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      document.removeEventListener('visibilitychange', aoVis);
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+    };
+  }, []);
+
+  return <canvas ref={ref} className="fundo-shader" aria-hidden="true" />;
+}
+ARQUIVO
+
+cat > src/components/PastaIcone.tsx <<'ARQUIVO'
+export function PastaIcone() {
+  return (
+    <svg className="pasta-icone" viewBox="0 0 48 48" fill="none" aria-hidden="true" focusable="false">
+      <path className="pasta__verso" d="M6 13a3 3 0 0 1 3-3h8.2a3 3 0 0 1 2.4 1.2l1.6 2.1a3 3 0 0 0 2.4 1.2H39a3 3 0 0 1 3 3v15a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3V13Z" />
+      <g className="pasta__folhas">
+        <rect className="pasta__folha pasta__folha--tres" x="14" y="16" width="20" height="13" rx="2" />
+        <rect className="pasta__folha pasta__folha--dois" x="15.5" y="17.5" width="20" height="13" rx="2" />
+        <rect className="pasta__folha pasta__folha--um" x="17" y="19" width="20" height="13" rx="2" />
+      </g>
+      <path className="pasta__frente" d="M6 23h36v5a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3v-5Z" />
+    </svg>
+  );
+}
+ARQUIVO
+
+cat > src/components/ListaAtividades.tsx <<'ARQUIVO'
+'use client';
+import { useLiveQuery } from 'dexie-react-hooks';
+import Link from 'next/link';
+import { db } from '@/lib/db';
+import { proximasAtividades, ROTULO } from '@/lib/atividades';
+
+export function ListaAtividades() {
+  const atividades = useLiveQuery(() => db.atividades.toArray(), []);
+  if (!atividades) return <p className="texto-sm texto-suave">Carregando...</p>;
+  if (atividades.length === 0) {
+    return <p className="texto-sm texto-suave">Nenhuma atividade. <Link href="/calendario" style={{ color: 'var(--marca)' }}>Criar a primeira</Link>.</p>;
+  }
+  const proximas = proximasAtividades(atividades, new Date(), 5);
+  if (proximas.length === 0) return <p className="texto-sm texto-suave">Tudo concluido.</p>;
+
+  return (
+    <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+      {proximas.map((a) => (
+        <li key={a.id} className="item">
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div className="item-titulo">{a.titulo}</div>
+            <div className="texto-xs texto-suave num">
+              {new Date(a.prazo).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}
+            </div>
+          </div>
+          <span className={'status status-' + a.status}>{ROTULO[a.status]}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+ARQUIVO
+
+cat > src/app/page.tsx <<'ARQUIVO'
+'use client';
+import { useEffect } from 'react';
+import Link from 'next/link';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { db, garantirSeed } from '@/lib/db';
+import { ListaAtividades } from '@/components/ListaAtividades';
+import { FundoShader } from '@/components/FundoShader';
+
+export default function Inicio() {
+  useEffect(() => { garantirSeed(); }, []);
+
+  const c = useLiveQuery(async () => {
+    const [ativas, concluidas, arquivos, trabalhos] = await Promise.all([
+      db.atividades.filter((a) => !a.concluidaEm).count(),
+      db.atividades.filter((a) => !!a.concluidaEm).count(),
+      db.arquivos.count(),
+      db.trabalhos.count(),
+    ]);
+    return { ativas, concluidas, arquivos, trabalhos };
+  }, []);
+
+  return (
+    <>
+      <FundoShader />
+      <div className="camada-conteudo">
+        <section style={{ marginBottom: 'var(--esp-7)' }}>
+          <h1 style={{ maxWidth: '22ch' }}>Sua rotina escolar em um lugar so.</h1>
+          <p className="texto-suave" style={{ maxWidth: '52ch' }}>
+            Prazos, notas e materiais organizados, com a Nexi IA para ajudar na escrita.
+            Tudo fica salvo no seu aparelho.
+          </p>
+        </section>
+
+        <div className="grade" style={{ marginBottom: 'var(--esp-6)' }}>
+          <Link href="/calendario" className="card">
+            <div className="texto-xs texto-suave" style={{ textTransform: 'uppercase', letterSpacing: '.06em' }}>Atividades</div>
+            <div className="num" style={{ fontSize: 'var(--txt-3xl)', fontWeight: 700, color: 'var(--marca)' }}>{c?.ativas ?? '-'}</div>
+            <div className="texto-sm texto-suave">pendentes agora</div>
+          </Link>
+          <Link href="/boletim" className="card">
+            <div className="texto-xs texto-suave" style={{ textTransform: 'uppercase', letterSpacing: '.06em' }}>Concluidas</div>
+            <div className="num" style={{ fontSize: 'var(--txt-3xl)', fontWeight: 700, color: 'var(--ok)' }}>{c?.concluidas ?? '-'}</div>
+            <div className="texto-sm texto-suave">finalizadas</div>
+          </Link>
+          <Link href="/arquivos" className="card">
+            <div className="texto-xs texto-suave" style={{ textTransform: 'uppercase', letterSpacing: '.06em' }}>Materiais</div>
+            <div className="num" style={{ fontSize: 'var(--txt-3xl)', fontWeight: 700, color: 'var(--marca)' }}>{(c?.arquivos ?? 0) + (c?.trabalhos ?? 0)}</div>
+            <div className="texto-sm texto-suave">arquivos e trabalhos</div>
+          </Link>
+          <Link href="/nexi" className="card">
+            <div className="texto-xs texto-suave" style={{ textTransform: 'uppercase', letterSpacing: '.06em' }}>Nexi IA</div>
+            <div style={{ fontSize: 'var(--txt-xl)', fontWeight: 700, margin: '6px 0 2px' }}>Conversar</div>
+            <div className="texto-sm texto-suave">tres modos de resposta</div>
+          </Link>
+        </div>
+
+        <div className="card">
+          <div className="card-titulo">
+            <h2>Proximas atividades</h2>
+            <Link href="/calendario" className="texto-sm" style={{ color: 'var(--marca)' }}>Ver todas</Link>
+          </div>
+          <ListaAtividades />
+        </div>
+      </div>
+    </>
+  );
+}
+ARQUIVO
+
+cat > src/app/calendario/page.tsx <<'ARQUIVO'
+'use client';
+import { useState } from 'react';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { db } from '@/lib/db';
+import { calcularStatus, ROTULO } from '@/lib/atividades';
+
+const DIAS = ['D', 'S', 'T', 'Q', 'Q', 'S', 'S'];
+
+export default function Calendario() {
+  const [ref, setRef] = useState(() => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1); });
+  const [sel, setSel] = useState<string | null>(null);
+  const [titulo, setTitulo] = useState('');
+  const [prazo, setPrazo] = useState('');
+
+  const atividades = useLiveQuery(() => db.atividades.toArray(), []) ?? [];
+
+  const ano = ref.getFullYear();
+  const mes = ref.getMonth();
+  const primeiro = new Date(ano, mes, 1).getDay();
+  const total = new Date(ano, mes + 1, 0).getDate();
+
+  const celulas: (number | null)[] = [
+    ...Array(primeiro).fill(null),
+    ...Array.from({ length: total }, (_, i) => i + 1),
+  ];
+
+  const iso = (dia: number) => {
+    const d = new Date(ano, mes, dia);
+    return d.toISOString().slice(0, 10);
+  };
+
+  const doDia = (dia: number) => atividades.filter((a) => a.prazo.slice(0, 10) === iso(dia));
+
+  async function criar() {
+    if (!titulo.trim() || !prazo) return;
+    await db.atividades.add({
+      titulo: titulo.trim(),
+      prazo: new Date(prazo).toISOString(),
+      concluidaEm: null,
+      criadoEm: new Date().toISOString(),
+    });
+    setTitulo(''); setPrazo('');
+  }
+
+  async function alternar(id: number, feito: boolean) {
+    await db.atividades.update(id, { concluidaEm: feito ? null : new Date().toISOString() });
+  }
+
+  const listaSel = sel ? atividades.filter((a) => a.prazo.slice(0, 10) === sel) : [];
+
+  return (
+    <>
+      <div className="card" style={{ marginBottom: 'var(--esp-4)' }}>
+        <div className="card-titulo">
+          <h2>{ref.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' })}</h2>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="icone-btn" onClick={() => setRef(new Date(ano, mes - 1, 1))} aria-label="Mes anterior">&#8249;</button>
+            <button className="icone-btn" onClick={() => setRef(new Date(ano, mes + 1, 1))} aria-label="Proximo mes">&#8250;</button>
+          </div>
+        </div>
+        <div className="cal-grade">
+          {DIAS.map((d, i) => <div key={i} className="cal-cabecalho">{d}</div>)}
+          {celulas.map((dia, i) => {
+            if (dia === null) return <div key={'v' + i} />;
+            const chave = iso(dia);
+            const hoje = chave === new Date().toISOString().slice(0, 10);
+            const tem = doDia(dia).length;
+            const cls = ['cal-dia'];
+            if (hoje) cls.push('hoje');
+            if (sel === chave) cls.push('selecionado');
+            return (
+              <button key={chave} className={cls.join(' ')} onClick={() => setSel(sel === chave ? null : chave)}>
+                {dia}
+                {tem > 0 && <span className="ponto" />}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {sel && (
+        <div className="card" style={{ marginBottom: 'var(--esp-4)' }}>
+          <div className="card-titulo">
+            <h3>{new Date(sel + 'T12:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'long' })}</h3>
+            <span className="texto-xs texto-suave">{listaSel.length} atividade(s)</span>
+          </div>
+          {listaSel.length === 0 && <p className="texto-sm texto-suave">Nada neste dia.</p>}
+          <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+            {listaSel.map((a) => {
+              const st = calcularStatus(a);
+              return (
+                <li key={a.id} className="item">
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div className="item-titulo" style={{ textDecoration: a.concluidaEm ? 'line-through' : 'none' }}>{a.titulo}</div>
+                    <div className="texto-xs texto-suave num">{new Date(a.prazo).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</div>
+                  </div>
+                  <span className={'status status-' + st}>{ROTULO[st]}</span>
+                  <button className="btn btn-fantasma btn-pequeno" onClick={() => alternar(a.id!, !!a.concluidaEm)}>
+                    {a.concluidaEm ? 'Reabrir' : 'Concluir'}
+                  </button>
+                  <button className="btn btn-perigo btn-pequeno" onClick={() => db.atividades.delete(a.id!)}>Excluir</button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      <div className="card">
+        <h3>Nova atividade</h3>
+        <div className="linha-campos">
+          <div className="campo">
+            <label htmlFor="t">Titulo</label>
+            <input id="t" value={titulo} onChange={(e) => setTitulo(e.target.value)} placeholder="Trabalho de Historia" />
+          </div>
+          <div className="campo">
+            <label htmlFor="p">Prazo</label>
+            <input id="p" type="datetime-local" value={prazo} onChange={(e) => setPrazo(e.target.value)} />
+          </div>
+        </div>
+        <button className="btn btn-primario" onClick={criar} disabled={!titulo.trim() || !prazo}>Adicionar</button>
+      </div>
+    </>
+  );
+}
+ARQUIVO
+
+cat > src/app/boletim/page.tsx <<'ARQUIVO'
+'use client';
+import { useEffect } from 'react';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { db, garantirSeed } from '@/lib/db';
+import { calcularDisciplina, salvarNota, pontosParaTexto } from '@/lib/boletim';
+
+export default function Boletim() {
+  useEffect(() => { garantirSeed(); }, []);
+
+  const dados = useLiveQuery(async () => {
+    const [disciplinas, notas] = await Promise.all([db.disciplinas.toArray(), db.notas.toArray()]);
+    return disciplinas.sort((a, b) => a.ordem - b.ordem).map((d) => ({
+      disciplina: d,
+      decimos: [1, 2, 3].map((u) => {
+        const n = notas.find((x) => x.disciplinaId === d.id && x.unidade === u);
+        return n ? n.decimos : null;
+      }) as (number | null)[],
+    }));
+  }, []);
+
+  if (!dados) return <p className="texto-sm texto-suave">Carregando...</p>;
+
+  const resultados = dados.map((d) => calcularDisciplina(d.decimos));
+  const totalGeral = resultados.reduce((s, r) => s + r.totalPontos, 0);
+  const completas = resultados.filter((r) => r.completo).length;
+
+  return (
+    <>
+      <div className="grade" style={{ marginBottom: 'var(--esp-4)' }}>
+        <div className="card">
+          <div className="texto-xs texto-suave">Total acumulado</div>
+          <div className="num" style={{ fontSize: 'var(--txt-3xl)', fontWeight: 700, color: 'var(--marca)' }}>{pontosParaTexto(totalGeral)}</div>
+          <div className="texto-sm texto-suave">de {dados.length * 15} possiveis</div>
+        </div>
+        <div className="card">
+          <div className="texto-xs texto-suave">Disciplinas completas</div>
+          <div className="num" style={{ fontSize: 'var(--txt-3xl)', fontWeight: 700 }}>{completas}/{dados.length}</div>
+          <div className="texto-sm texto-suave">tres unidades lancadas</div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-titulo"><h2>Notas por unidade</h2></div>
+        <div className="tabela-wrap">
+          <table className="boletim">
+            <thead>
+              <tr>
+                <th>Disciplina</th>
+                <th>1a</th>
+                <th>2a</th>
+                <th>3a</th>
+                <th>Total</th>
+                <th>Situacao</th>
+              </tr>
+            </thead>
+            <tbody>
+              {dados.map((linha, i) => {
+                const r = resultados[i];
+                return (
+                  <tr key={linha.disciplina.id}>
+                    <td style={{ minWidth: 160 }}>{linha.disciplina.nome}</td>
+                    {[0, 1, 2].map((idx) => (
+                      <td key={idx}>
+                        <input
+                          type="number"
+                          min={0}
+                          max={10}
+                          step={0.1}
+                          defaultValue={linha.decimos[idx] != null ? (linha.decimos[idx]! / 10).toString() : ''}
+                          onBlur={(e) => {
+                            const v = e.target.value.trim();
+                            salvarNota(linha.disciplina.id!, (idx + 1) as 1 | 2 | 3, v === '' ? null : Number
